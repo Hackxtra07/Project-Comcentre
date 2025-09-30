@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Project Manager
+Comment=Launch my Python app in virtualenv
+Exec=gnome-terminal -- /home/kali/Desktop/HackXtra-Projects/Software/Project-Comcentre/run.sh
+Icon=/home/kali/Downloads/png/hackxtra.png
+Terminal=false
+Path=
+StartupNotify=false
