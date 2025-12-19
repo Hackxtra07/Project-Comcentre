@@ -12,3 +12,5 @@ password- hackxtra
  after running this 
 
 run " python3 app.py " to run the software 
+
+<img width="1208" height="897" alt="image" src="https://github.com/user-attachments/assets/9952a02a-53ed-4dfc-8305-0a7ffc23ed72" />
