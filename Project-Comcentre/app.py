@@ -1260,9 +1260,10 @@ class TemplateEditorDialog:
         pattern = self.pattern_entry.get().strip()
         desc = self.desc_entry.get().strip()
         try:
-            metadata = json.loads(self.meta_text.get("1.0", tk.END) or "{}")
+            meta_str = self.meta_text.get("1.0", tk.END).strip()
+            metadata = json.loads(meta_str) if meta_str else {}
         except Exception as e:
-            messagebox.showerror("Metadata error", str(e));
+            messagebox.showerror("Metadata error", str(e))
             return
         if not name or not pattern:
             messagebox.showerror("Missing", "Name and pattern are required");
