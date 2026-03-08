@@ -1262,6 +1262,13 @@ class TemplateEditorDialog:
         try:
             meta_str = self.meta_text.get("1.0", tk.END).strip()
             metadata = json.loads(meta_str) if meta_str else {}
+            
+            # Auto-populate metadata params from pattern if not provided
+            if not metadata.get("params"):
+                _, generated_meta = parse_plain_text_template(pattern)
+                if generated_meta.get("params"):
+                    metadata["params"] = generated_meta["params"]
+                    
         except Exception as e:
             messagebox.showerror("Metadata error", str(e))
             return
