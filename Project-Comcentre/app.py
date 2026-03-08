@@ -11,7 +11,8 @@ Date: 2025-09-28 (UTC)
 
 import os
 import sys
-import sqlite3
+import pymongo
+from bson.objectid import ObjectId
 import json
 import threading
 import queue
@@ -76,280 +77,188 @@ def which(cmd):
 # -------------------------
 # Database initialization
 # -------------------------
-def init_db():
-    first_time = not os.path.exists(APP_DB)
-    conn = sqlite3.connect(APP_DB, check_same_thread=False)
-    cur = conn.cursor()
-    # Users: username, password_hash, role (admin/operator/viewer)
-    cur.execute("""CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY,
-        username TEXT UNIQUE,
-        password_hash TEXT,
-        role TEXT CHECK(role IN ('admin','operator','viewer')) NOT NULL DEFAULT 'operator'
-    )""")
-    # Templates
-    cur.execute("""CREATE TABLE IF NOT EXISTS templates (
-        id INTEGER PRIMARY KEY,
-        name TEXT UNIQUE,
-        pattern TEXT,
-        metadata_json TEXT,
-        description TEXT,
-        approved INTEGER DEFAULT 0,
-        created_by TEXT,
-        created_at TEXT
-    )""")
-    # Logs
-    cur.execute("""CREATE TABLE IF NOT EXISTS logs (
-        id INTEGER PRIMARY KEY,
-        template_id INTEGER,
-        template_name TEXT,
-        user TEXT,
-        params_json TEXT,
-        command TEXT,
-        stdout TEXT,
-        stderr TEXT,
-        rc INTEGER,
-        started_at TEXT,
-        finished_at TEXT
-    )""")
-    # Settings
-    cur.execute("""CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )""")
-    # Scheduled jobs persisted
-    cur.execute("""CREATE TABLE IF NOT EXISTS scheduled_jobs (
-        id INTEGER PRIMARY KEY,
-        template_id INTEGER,
-        params_json TEXT,
-        run_at TEXT,
-        created_by TEXT,
-        created_at TEXT,
-        executed INTEGER DEFAULT 0
-    )""")
-    conn.commit()
+MONGO_URI = "mongodb+srv://manankamboj66_db_user:HeZJf1a7BKEQq3IF@globaldb.jmzxyvp.mongodb.net/?appName=GlobalDB"
 
+def init_db():
+    client = pymongo.MongoClient(MONGO_URI)
+    db = client["advanced_automator_monolith"]
+    
     # Default admin
-    cur.execute("SELECT COUNT(*) FROM users")
-    if cur.fetchone()[0] == 0:
-        cur.execute("INSERT INTO users (username,password_hash,role) VALUES (?,?,?)",
-                    (DEFAULT_ADMIN, hash_pw(DEFAULT_ADMIN_PASS), "admin"))
-        conn.commit()
+    if db.users.count_documents({}) == 0:
+        db.users.insert_one({"username": DEFAULT_ADMIN, "password_hash": hash_pw(DEFAULT_ADMIN_PASS), "role": "admin"})
 
     # Default whitelist
-    cur.execute("SELECT value FROM settings WHERE key='whitelist'")
-    if not cur.fetchone():
-        cur.execute("INSERT INTO settings (key,value) VALUES (?, ?)", ("whitelist", json.dumps(DEFAULT_WHITELIST)))
-    # Execution flag (disabled)
-    cur.execute("SELECT value FROM settings WHERE key='execution_enabled'")
-    if not cur.fetchone():
-        cur.execute("INSERT INTO settings (key,value) VALUES (?, ?)", ("execution_enabled", json.dumps(False)))
+    if db.settings.count_documents({"key": "whitelist"}) == 0:
+        db.settings.insert_one({"key": "whitelist", "value": json.dumps(DEFAULT_WHITELIST)})
+    # Execution flag
+    if db.settings.count_documents({"key": "execution_enabled"}) == 0:
+        db.settings.insert_one({"key": "execution_enabled", "value": json.dumps(False)})
     # Theme
-    cur.execute("SELECT value FROM settings WHERE key='theme'")
-    if not cur.fetchone():
-        cur.execute("INSERT INTO settings (key,value) VALUES (?, ?)", ("theme", json.dumps("light")))
-    conn.commit()
-    return conn
-
+    if db.settings.count_documents({"key": "theme"}) == 0:
+        db.settings.insert_one({"key": "theme", "value": json.dumps("light")})
+    
+    return db
 
 DB = init_db()
 DB_LOCK = threading.Lock()
-
 
 # -------------------------
 # Database helpers
 # -------------------------
 def get_setting(key, default=None):
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute("SELECT value FROM settings WHERE key=?", (key,))
-        r = cur.fetchone()
-        return json.loads(r[0]) if r else default
-
+        r = DB.settings.find_one({"key": key})
+        return json.loads(r["value"]) if r else default
 
 def set_setting(key, value):
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute("REPLACE INTO settings (key,value) VALUES (?, ?)", (key, json.dumps(value)))
-        DB.commit()
-
+        DB.settings.update_one({"key": key}, {"$set": {"value": json.dumps(value)}}, upsert=True)
 
 def get_whitelist():
     return get_setting("whitelist", DEFAULT_WHITELIST)
 
-
 def set_whitelist(lst):
     set_setting("whitelist", lst)
-
 
 def execution_enabled():
     return bool(get_setting("execution_enabled", False))
 
-
 def set_execution_enabled(v: bool):
     set_setting("execution_enabled", bool(v))
-
 
 def get_theme():
     return get_setting("theme", "light")
 
-
 def set_theme(t: str):
     set_setting("theme", t)
-
 
 # Users
 def add_user(username, password, role="operator"):
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute("INSERT INTO users (username,password_hash,role) VALUES (?, ?, ?)",
-                    (username, hash_pw(password), role))
-        DB.commit()
-
+        DB.users.insert_one({"username": username, "password_hash": hash_pw(password), "role": role})
 
 def delete_user(username):
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute("DELETE FROM users WHERE username=?", (username,))
-        DB.commit()
-
+        DB.users.delete_one({"username": username})
 
 def list_users():
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute("SELECT username, role FROM users ORDER BY username")
-        return cur.fetchall()
-
+        rows = DB.users.find().sort("username", 1)
+        return [(r["username"], r["role"]) for r in rows]
 
 def authenticate(username, password):
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute("SELECT password_hash FROM users WHERE username=?", (username,))
-        r = cur.fetchone()
-        return bool(r and r[0] == hash_pw(password))
-
+        r = DB.users.find_one({"username": username})
+        return bool(r and r["password_hash"] == hash_pw(password))
 
 def get_user_role(username):
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute("SELECT role FROM users WHERE username=?", (username,))
-        r = cur.fetchone()
-        return r[0] if r else None
-
+        r = DB.users.find_one({"username": username})
+        return r["role"] if r else None
 
 # Templates
 def list_templates():
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute(
-            "SELECT id,name,pattern,metadata_json,description,approved,created_by,created_at FROM templates ORDER BY name")
-        rows = cur.fetchall()
-    templates = []
-    for r in rows:
-        templates.append({
-            "id": r[0],
-            "name": r[1],
-            "pattern": r[2],
-            "metadata": json.loads(r[3]) if r[3] else {},
-            "description": r[4],
-            "approved": bool(r[5]),
-            "created_by": r[6],
-            "created_at": r[7]
-        })
-    return templates
-
+        rows = DB.templates.find().sort("name", 1)
+        templates = []
+        for r in rows:
+            templates.append({
+                "id": str(r["_id"]),
+                "name": r["name"],
+                "pattern": r["pattern"],
+                "metadata": json.loads(r["metadata_json"]) if r.get("metadata_json") else {},
+                "description": r.get("description", ""),
+                "approved": bool(r.get("approved", 0)),
+                "created_by": r.get("created_by", ""),
+                "created_at": r.get("created_at", "")
+            })
+        return templates
 
 def save_template(name, pattern, metadata, description, created_by, approved=False):
     safe_check_text(pattern)
     if not re.match(r'^[A-Za-z0-9_\- ]+$', name):
         raise ValueError("Template name has invalid characters.")
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute("""INSERT OR REPLACE INTO templates (name,pattern,metadata_json,description,approved,created_by,created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (name, pattern, json.dumps(metadata), description, int(bool(approved)), created_by, now_iso()))
-        DB.commit()
-
+        DB.templates.update_one(
+            {"name": name},
+            {"$set": {
+                "pattern": pattern,
+                "metadata_json": json.dumps(metadata),
+                "description": description,
+                "approved": int(bool(approved)),
+                "created_by": created_by,
+                "created_at": now_iso()
+            }},
+            upsert=True
+        )
 
 def delete_template(template_id):
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute("DELETE FROM templates WHERE id=?", (template_id,))
-        DB.commit()
-
+        DB.templates.delete_one({"_id": ObjectId(template_id)})
 
 def approve_template(template_id):
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute("UPDATE templates SET approved=1 WHERE id=?", (template_id,))
-        DB.commit()
-
+        DB.templates.update_one({"_id": ObjectId(template_id)}, {"$set": {"approved": 1}})
 
 # Logs
 def log_run(template_id, template_name, user, params, command, stdout, stderr, rc, started_at, finished_at):
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute("""INSERT INTO logs (template_id, template_name, user, params_json, command, stdout, stderr, rc, started_at, finished_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (template_id, template_name, user, json.dumps(params), command, stdout, stderr, rc, started_at,
-                     finished_at))
-        DB.commit()
-
+        DB.logs.insert_one({
+            "template_id": template_id,
+            "template_name": template_name,
+            "user": user,
+            "params_json": json.dumps(params),
+            "command": command,
+            "stdout": stdout,
+            "stderr": stderr,
+            "rc": rc,
+            "started_at": started_at,
+            "finished_at": finished_at
+        })
 
 def get_logs(limit=1000):
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute("SELECT id, template_name, user, started_at, finished_at, rc FROM logs ORDER BY id DESC LIMIT ?",
-                    (limit,))
-        return cur.fetchall()
-
+        rows = DB.logs.find().sort("_id", -1).limit(limit)
+        return [(str(r["_id"]), r["template_name"], r["user"], r["started_at"], r["finished_at"], r["rc"]) for r in rows]
 
 def get_log_detail(log_id):
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute(
-            "SELECT template_name,user,params_json,command,stdout,stderr,rc,started_at,finished_at FROM logs WHERE id=?",
-            (log_id,))
-        return cur.fetchone()
-
+        r = DB.logs.find_one({"_id": ObjectId(log_id)})
+        if r:
+            return (r["template_name"], r["user"], r["params_json"], r["command"], r["stdout"], r["stderr"], r["rc"], r["started_at"], r["finished_at"])
+        return None
 
 # Scheduled jobs persistence
 def add_scheduled_job(template_id, params, run_at_ts, created_by):
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute(
-            "INSERT INTO scheduled_jobs (template_id, params_json, run_at, created_by, created_at, executed) VALUES (?, ?, ?, ?, ?, 0)",
-            (template_id, json.dumps(params), datetime.datetime.utcfromtimestamp(run_at_ts).isoformat() + "Z",
-             created_by, now_iso()))
-        DB.commit()
-        return cur.lastrowid
-
+        res = DB.scheduled_jobs.insert_one({
+            "template_id": template_id,
+            "params_json": json.dumps(params),
+            "run_at": datetime.datetime.utcfromtimestamp(run_at_ts).isoformat() + "Z",
+            "created_by": created_by,
+            "created_at": now_iso(),
+            "executed": 0
+        })
+        return str(res.inserted_id)
 
 def list_scheduled_jobs():
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute(
-            "SELECT id, template_id, params_json, run_at, created_by, executed FROM scheduled_jobs ORDER BY run_at")
-        rows = cur.fetchall()
-    out = []
-    for r in rows:
-        out.append({
-            "id": r[0],
-            "template_id": r[1],
-            "params": json.loads(r[2]),
-            "run_at": r[3],
-            "created_by": r[4],
-            "executed": bool(r[5])
-        })
-    return out
-
+        rows = DB.scheduled_jobs.find().sort("run_at", 1)
+        out = []
+        for r in rows:
+            out.append({
+                "id": str(r["_id"]),
+                "template_id": r["template_id"],
+                "params": json.loads(r.get("params_json", "{}")),
+                "run_at": r["run_at"],
+                "created_by": r["created_by"],
+                "executed": bool(r.get("executed", 0))
+            })
+        return out
 
 def mark_scheduled_executed(job_id):
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute("UPDATE scheduled_jobs SET executed=1 WHERE id=?", (job_id,))
-        DB.commit()
-
+        DB.scheduled_jobs.update_one({"_id": ObjectId(job_id)}, {"$set": {"executed": 1}})
 
 # -------------------------
 # Command builder and safety
@@ -1289,9 +1198,7 @@ class UsersDialog:
 
 def update_password(username, newpw):
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute("UPDATE users SET password_hash=? WHERE username=?", (hash_pw(newpw), username))
-        DB.commit()
+        DB.users.update_one({"username": username}, {"$set": {"password_hash": hash_pw(newpw)}})
 
 
 class SettingsDialog:
@@ -1490,15 +1397,13 @@ class LogsDialog:
         p = filedialog.asksaveasfilename(defaultextension=".csv")
         if not p: return
         with DB_LOCK:
-            cur = DB.cursor()
-            cur.execute(
-                "SELECT id,template_name,user,params_json,command,stdout,stderr,rc,started_at,finished_at FROM logs ORDER BY id DESC")
-            rows = cur.fetchall()
+            rows = DB.logs.find().sort("_id", -1)
+            rows = list(rows)
         with open(p, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["id", "template", "user", "params", "command", "stdout", "stderr", "rc", "started", "finished"])
             for r in rows:
-                w.writerow(r)
+                w.writerow([str(r["_id"]), r.get("template_name"), r.get("user"), r.get("params_json"), r.get("command"), r.get("stdout"), r.get("stderr"), r.get("rc"), r.get("started_at"), r.get("finished_at")])
         messagebox.showinfo("Exported", f"Exported {len(rows)} logs to {p}")
 
 
@@ -1516,48 +1421,49 @@ class ViewWindow:
 # -------------------------
 def ensure_samples():
     with DB_LOCK:
-        cur = DB.cursor()
-        cur.execute("SELECT COUNT(*) FROM templates")
-        if cur.fetchone()[0] == 0:
+        if DB.templates.count_documents({}) == 0:
             sample1 = {
                 "name": "Show uptime",
                 "pattern": "uptime",
-                "metadata": {"params": []},
+                "metadata_json": json.dumps({"params": []}),
                 "description": "Show system uptime",
-                "approved": 1
+                "approved": 1,
+                "created_by": "system",
+                "created_at": now_iso()
             }
             sample2 = {
                 "name": "Echo",
                 "pattern": "echo {msg}",
-                "metadata": {"params": [{"name": "msg", "type": "string", "label": "Message", "default": "hello"}]},
+                "metadata_json": json.dumps({"params": [{"name": "msg", "type": "string", "label": "Message", "default": "hello"}]}),
                 "description": "Echo message (safe example)",
-                "approved": 1
+                "approved": 1,
+                "created_by": "system",
+                "created_at": now_iso()
             }
             sample3 = {
                 "name": "Nmap",
                 "pattern": "nmap {target}",
-                "metadata": {"params": [
-                    {"name": "target", "type": "string", "label": "Target Ip Or Hostanme", "default": "127.0.0.1"}]},
+                "metadata_json": json.dumps({"params": [
+                    {"name": "target", "type": "string", "label": "Target Ip Or Hostanme", "default": "127.0.0.1"}]}),
                 "description": "Simple Nmap target scan ",
-                "approved": 1
-
+                "approved": 1,
+                "created_by": "system",
+                "created_at": now_iso()
             }
             sample4 = {
                 "name": "Nmap Ping Sweep",
                 "pattern": "nmap -sn {target} ",
-                "metadata": {"params": [
+                "metadata_json": json.dumps({"params": [
                     {"name": "targets", "type": "string", "label": "Targets (CIDR, range or comma-separated)",
-                     "default": ""}]},
+                     "default": ""}]}),
                 "description": "Ping sweep / host discovery for network (use CIDR or range).",
-                "approved": 1
+                "approved": 1,
+                "created_by": "system",
+                "created_at": now_iso()
             }
 
             for s in (sample1, sample2, sample3, sample4):
-                cur.execute(
-                    "INSERT OR REPLACE INTO templates (name,pattern,metadata_json,description,approved,created_by,created_at) VALUES (?,?,?,?,?,?,?)",
-                    (s["name"], s["pattern"], json.dumps(s["metadata"]), s["description"], int(s["approved"]), "system",
-                     now_iso()))
-            DB.commit()
+                DB.templates.update_one({"name": s["name"]}, {"$set": s}, upsert=True)
 
 
 ensure_samples()
