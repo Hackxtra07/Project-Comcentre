@@ -11,8 +11,6 @@ Date: 2025-09-28 (UTC)
 
 import os
 import sys
-import pymongo
-from bson.objectid import ObjectId
 import json
 import threading
 import queue
@@ -26,6 +24,9 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog, scrolledtext
+
+# ── Hybrid DB ─────────────────────────────────────────────────────────────────
+from hybrid_db import get_db
 
 # -------------------------
 # Configuration & safety
@@ -75,44 +76,28 @@ def which(cmd):
 
 
 # -------------------------
-# Database initialization
+# Hybrid Database initialisation
 # -------------------------
-MONGO_URI = "mongodb+srv://manankamboj66_db_user:HeZJf1a7BKEQq3IF@globaldb.jmzxyvp.mongodb.net/?appName=GlobalDB"
+DB = get_db()                   # HybridDB singleton
+DB_LOCK = threading.Lock()      # kept for legacy compat (HybridDB has its own internal lock)
 
-def init_db():
-    client = pymongo.MongoClient(MONGO_URI)
-    db = client["advanced_automator_monolith"]
-    
-    # Default admin
-    if db.users.count_documents({}) == 0:
-        db.users.insert_one({"username": DEFAULT_ADMIN, "password_hash": hash_pw(DEFAULT_ADMIN_PASS), "role": "admin"})
-
-    # Default whitelist
-    if db.settings.count_documents({"key": "whitelist"}) == 0:
-        db.settings.insert_one({"key": "whitelist", "value": json.dumps(DEFAULT_WHITELIST)})
-    # Execution flag
-    if db.settings.count_documents({"key": "execution_enabled"}) == 0:
-        db.settings.insert_one({"key": "execution_enabled", "value": json.dumps(False)})
-    # Theme
-    if db.settings.count_documents({"key": "theme"}) == 0:
-        db.settings.insert_one({"key": "theme", "value": json.dumps("light")})
-    
-    return db
-
-DB = init_db()
-DB_LOCK = threading.Lock()
+# Ensure default admin + settings exist
+DB.ensure_default_user(DEFAULT_ADMIN, hash_pw(DEFAULT_ADMIN_PASS), "admin")
+if DB.get_setting("whitelist") is None:
+    DB.set_setting("whitelist", DEFAULT_WHITELIST)
+if DB.get_setting("execution_enabled") is None:
+    DB.set_setting("execution_enabled", False)
+if DB.get_setting("theme") is None:
+    DB.set_setting("theme", "light")
 
 # -------------------------
-# Database helpers
+# Database helpers (delegating to HybridDB)
 # -------------------------
 def get_setting(key, default=None):
-    with DB_LOCK:
-        r = DB.settings.find_one({"key": key})
-        return json.loads(r["value"]) if r else default
+    return DB.get_setting(key, default)
 
 def set_setting(key, value):
-    with DB_LOCK:
-        DB.settings.update_one({"key": key}, {"$set": {"value": json.dumps(value)}}, upsert=True)
+    DB.set_setting(key, value)
 
 def get_whitelist():
     return get_setting("whitelist", DEFAULT_WHITELIST)
@@ -134,131 +119,56 @@ def set_theme(t: str):
 
 # Users
 def add_user(username, password, role="operator"):
-    with DB_LOCK:
-        DB.users.insert_one({"username": username, "password_hash": hash_pw(password), "role": role})
+    DB.add_user(username, hash_pw(password), role)
 
 def delete_user(username):
-    with DB_LOCK:
-        DB.users.delete_one({"username": username})
+    DB.delete_user(username)
 
 def list_users():
-    with DB_LOCK:
-        rows = DB.users.find().sort("username", 1)
-        return [(r["username"], r["role"]) for r in rows]
+    return DB.list_users()
 
 def authenticate(username, password):
-    with DB_LOCK:
-        r = DB.users.find_one({"username": username})
-        return bool(r and r["password_hash"] == hash_pw(password))
+    return DB.authenticate(username, hash_pw(password))
 
 def get_user_role(username):
-    with DB_LOCK:
-        r = DB.users.find_one({"username": username})
-        return r["role"] if r else None
+    return DB.get_user_role(username)
 
 # Templates
 def list_templates():
-    with DB_LOCK:
-        rows = DB.templates.find().sort("name", 1)
-        templates = []
-        for r in rows:
-            templates.append({
-                "id": str(r["_id"]),
-                "name": r["name"],
-                "pattern": r["pattern"],
-                "metadata": json.loads(r["metadata_json"]) if r.get("metadata_json") else {},
-                "description": r.get("description", ""),
-                "approved": bool(r.get("approved", 0)),
-                "created_by": r.get("created_by", ""),
-                "created_at": r.get("created_at", "")
-            })
-        return templates
+    return DB.list_templates()
 
 def save_template(name, pattern, metadata, description, created_by, approved=False):
     safe_check_text(pattern)
     if not re.match(r'^[A-Za-z0-9_\- ]+$', name):
         raise ValueError("Template name has invalid characters.")
-    with DB_LOCK:
-        DB.templates.update_one(
-            {"name": name},
-            {"$set": {
-                "pattern": pattern,
-                "metadata_json": json.dumps(metadata),
-                "description": description,
-                "approved": int(bool(approved)),
-                "created_by": created_by,
-                "created_at": now_iso()
-            }},
-            upsert=True
-        )
+    DB.save_template(name, pattern, metadata, description, created_by, approved)
 
 def delete_template(template_id):
-    with DB_LOCK:
-        DB.templates.delete_one({"_id": ObjectId(template_id)})
+    DB.delete_template(template_id)
 
 def approve_template(template_id):
-    with DB_LOCK:
-        DB.templates.update_one({"_id": ObjectId(template_id)}, {"$set": {"approved": 1}})
+    DB.approve_template(template_id)
 
 # Logs
 def log_run(template_id, template_name, user, params, command, stdout, stderr, rc, started_at, finished_at):
-    with DB_LOCK:
-        DB.logs.insert_one({
-            "template_id": template_id,
-            "template_name": template_name,
-            "user": user,
-            "params_json": json.dumps(params),
-            "command": command,
-            "stdout": stdout,
-            "stderr": stderr,
-            "rc": rc,
-            "started_at": started_at,
-            "finished_at": finished_at
-        })
+    DB.log_run(template_id, template_name, user, json.dumps(params), command, stdout, stderr, rc, started_at, finished_at)
 
 def get_logs(limit=1000):
-    with DB_LOCK:
-        rows = DB.logs.find().sort("_id", -1).limit(limit)
-        return [(str(r["_id"]), r["template_name"], r["user"], r["started_at"], r["finished_at"], r["rc"]) for r in rows]
+    return DB.get_logs(limit)
 
 def get_log_detail(log_id):
-    with DB_LOCK:
-        r = DB.logs.find_one({"_id": ObjectId(log_id)})
-        if r:
-            return (r["template_name"], r["user"], r["params_json"], r["command"], r["stdout"], r["stderr"], r["rc"], r["started_at"], r["finished_at"])
-        return None
+    return DB.get_log_detail(log_id)
 
-# Scheduled jobs persistence
+# Scheduled jobs
 def add_scheduled_job(template_id, params, run_at_ts, created_by):
-    with DB_LOCK:
-        res = DB.scheduled_jobs.insert_one({
-            "template_id": template_id,
-            "params_json": json.dumps(params),
-            "run_at": datetime.datetime.utcfromtimestamp(run_at_ts).isoformat() + "Z",
-            "created_by": created_by,
-            "created_at": now_iso(),
-            "executed": 0
-        })
-        return str(res.inserted_id)
+    run_at = datetime.datetime.utcfromtimestamp(run_at_ts).isoformat() + "Z"
+    return DB.add_scheduled_job(template_id, json.dumps(params), run_at, created_by, now_iso())
 
 def list_scheduled_jobs():
-    with DB_LOCK:
-        rows = DB.scheduled_jobs.find().sort("run_at", 1)
-        out = []
-        for r in rows:
-            out.append({
-                "id": str(r["_id"]),
-                "template_id": r["template_id"],
-                "params": json.loads(r.get("params_json", "{}")),
-                "run_at": r["run_at"],
-                "created_by": r["created_by"],
-                "executed": bool(r.get("executed", 0))
-            })
-        return out
+    return DB.list_scheduled_jobs()
 
 def mark_scheduled_executed(job_id):
-    with DB_LOCK:
-        DB.scheduled_jobs.update_one({"_id": ObjectId(job_id)}, {"$set": {"executed": 1}})
+    DB.mark_scheduled_executed(job_id)
 
 # -------------------------
 # Command builder and safety
@@ -492,6 +402,11 @@ class App(tk.Tk):
         self.load_templates()
         self.apply_theme()
 
+        # Register hybrid-DB status callback so the status bar updates live
+        DB.register_status_callback(self._on_db_status_change)
+        # Set initial indicator
+        self._update_db_indicator(DB.is_online)
+
     def init_ui(self):
         # Menu
         menubar = tk.Menu(self)
@@ -502,6 +417,11 @@ class App(tk.Tk):
         admin_menu.add_command(label="Import Plain Text Template", command=self.import_plain_text_template)
         admin_menu.add_command(label="Export Templates (JSON)", command=self.export_templates)
         menubar.add_cascade(label="Admin", menu=admin_menu)
+        # DB menu
+        db_menu = tk.Menu(menubar, tearoff=0)
+        db_menu.add_command(label="Force Sync Now", command=self.force_db_sync)
+        db_menu.add_command(label="DB Status", command=self.show_db_status)
+        menubar.add_cascade(label="Database", menu=db_menu)
         menubar.add_command(label="Help", command=self.open_help)
         self.config(menu=menubar)
 
@@ -580,9 +500,14 @@ class App(tk.Tk):
         self.output_box = tk.Text(right, height=8)
         self.output_box.pack(fill="x", padx=2, pady=(4, 0))
 
-        # Bottom status
-        self.status = ttk.Label(self, text="Ready", anchor="w")
-        self.status.pack(fill="x", side="bottom")
+        # Bottom status bar (two labels side-by-side)
+        statusbar = ttk.Frame(self)
+        statusbar.pack(fill="x", side="bottom")
+        self.status = ttk.Label(statusbar, text="Ready", anchor="w")
+        self.status.pack(side="left", fill="x", expand=True)
+        self.db_indicator = ttk.Label(statusbar, text="● DB: checking…",
+                                      anchor="e", foreground="orange", width=28)
+        self.db_indicator.pack(side="right", padx=6)
 
     # -------------------------
     # Templates
@@ -933,6 +858,58 @@ class App(tk.Tk):
             else:
                 messagebox.showerror("Login failed", "Invalid credentials")
 
+    # -------------------------
+    # Hybrid DB helpers
+    # -------------------------
+    def _update_db_indicator(self, online: bool):
+        """Update the DB status indicator label (must be called from main thread)."""
+        try:
+            if online:
+                self.db_indicator.config(
+                    text="● DB: MongoDB Atlas (online)",
+                    foreground="green"
+                )
+            else:
+                self.db_indicator.config(
+                    text="● DB: SQLite (offline)",
+                    foreground="#e06c00"
+                )
+        except Exception:
+            pass
+
+    def _on_db_status_change(self, online: bool):
+        """Called from background thread when connectivity changes – schedule GUI update."""
+        self.after(0, lambda: self._update_db_indicator(online))
+        if online:
+            self.after(0, lambda: self.status.config(text="🔄 Reconnected – syncing data…"))
+        else:
+            self.after(0, lambda: self.status.config(text="⚠️  Internet lost – using local SQLite database"))
+
+    def force_db_sync(self):
+        """Menu action: Force an immediate sync attempt."""
+        if not DB.is_online:
+            messagebox.showinfo(
+                "Force Sync",
+                "Currently offline. Will attempt to reconnect and sync.\n"
+                "Watch the DB indicator in the bottom-right corner."
+            )
+        DB.force_sync()
+        self.status.config(text="🔄 Sync triggered – running in background…")
+
+    def show_db_status(self):
+        """Menu action: Show a detailed DB status dialog."""
+        mode = "MongoDB Atlas (ONLINE)" if DB.is_online else "SQLite local database (OFFLINE)"
+        from hybrid_db import SQLITE_PATH
+        msg = (
+            f"Current database mode:\n  {mode}\n\n"
+            f"MongoDB Atlas URI:\n  (configured in hybrid_db.py)\n\n"
+            f"Local SQLite path:\n  {SQLITE_PATH}\n\n"
+            "The app automatically switches to SQLite when offline\n"
+            "and syncs all changes back to MongoDB when internet\n"
+            "connection is restored."
+        )
+        messagebox.showinfo("Database Status", msg)
+
     def open_help(self):
         help_text = ("Advanced Kali Automator (Safe)\n\n"
                      "This application is safe-by-default. Execution of real commands is disabled until an admin enables it in Settings.\n\n"
@@ -1197,8 +1174,7 @@ class UsersDialog:
 
 
 def update_password(username, newpw):
-    with DB_LOCK:
-        DB.users.update_one({"username": username}, {"$set": {"password_hash": hash_pw(newpw)}})
+    DB.update_password(username, hash_pw(newpw))
 
 
 class SettingsDialog:
@@ -1404,14 +1380,25 @@ class LogsDialog:
     def export_csv(self):
         p = filedialog.asksaveasfilename(defaultextension=".csv")
         if not p: return
-        with DB_LOCK:
-            rows = DB.logs.find().sort("_id", -1)
-            rows = list(rows)
+        rows = DB.get_all_logs_raw()
         with open(p, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["id", "template", "user", "params", "command", "stdout", "stderr", "rc", "started", "finished"])
             for r in rows:
-                w.writerow([str(r["_id"]), r.get("template_name"), r.get("user"), r.get("params_json"), r.get("command"), r.get("stdout"), r.get("stderr"), r.get("rc"), r.get("started_at"), r.get("finished_at")])
+                # Support both Mongo dicts (have '_id') and SQLite dicts (have 'id'/'mongo_id')
+                row_id = str(r.get("_id", r.get("mongo_id") or r.get("id", "")))
+                w.writerow([
+                    row_id,
+                    r.get("template_name"),
+                    r.get("user"),
+                    r.get("params_json"),
+                    r.get("command"),
+                    r.get("stdout"),
+                    r.get("stderr"),
+                    r.get("rc"),
+                    r.get("started_at"),
+                    r.get("finished_at")
+                ])
         messagebox.showinfo("Exported", f"Exported {len(rows)} logs to {p}")
 
 
@@ -1428,50 +1415,48 @@ class ViewWindow:
 # Add a couple safe example templates (if none exist)
 # -------------------------
 def ensure_samples():
-    with DB_LOCK:
-        if DB.templates.count_documents({}) == 0:
-            sample1 = {
-                "name": "Show uptime",
-                "pattern": "uptime",
-                "metadata_json": json.dumps({"params": []}),
-                "description": "Show system uptime",
-                "approved": 1,
-                "created_by": "system",
-                "created_at": now_iso()
-            }
-            sample2 = {
-                "name": "Echo",
-                "pattern": "echo {msg}",
-                "metadata_json": json.dumps({"params": [{"name": "msg", "type": "string", "label": "Message", "default": "hello"}]}),
-                "description": "Echo message (safe example)",
-                "approved": 1,
-                "created_by": "system",
-                "created_at": now_iso()
-            }
-            sample3 = {
-                "name": "Nmap",
-                "pattern": "nmap {target}",
-                "metadata_json": json.dumps({"params": [
-                    {"name": "target", "type": "string", "label": "Target Ip Or Hostanme", "default": "127.0.0.1"}]}),
-                "description": "Simple Nmap target scan ",
-                "approved": 1,
-                "created_by": "system",
-                "created_at": now_iso()
-            }
-            sample4 = {
-                "name": "Nmap Ping Sweep",
-                "pattern": "nmap -sn {target} ",
-                "metadata_json": json.dumps({"params": [
-                    {"name": "targets", "type": "string", "label": "Targets (CIDR, range or comma-separated)",
-                     "default": ""}]}),
-                "description": "Ping sweep / host discovery for network (use CIDR or range).",
-                "approved": 1,
-                "created_by": "system",
-                "created_at": now_iso()
-            }
-
-            for s in (sample1, sample2, sample3, sample4):
-                DB.templates.update_one({"name": s["name"]}, {"$set": s}, upsert=True)
+    if DB.count_templates() == 0:
+        sample1 = {
+            "name": "Show uptime",
+            "pattern": "uptime",
+            "metadata_json": json.dumps({"params": []}),
+            "description": "Show system uptime",
+            "approved": 1,
+            "created_by": "system",
+            "created_at": now_iso()
+        }
+        sample2 = {
+            "name": "Echo",
+            "pattern": "echo {msg}",
+            "metadata_json": json.dumps({"params": [{"name": "msg", "type": "string", "label": "Message", "default": "hello"}]}),
+            "description": "Echo message (safe example)",
+            "approved": 1,
+            "created_by": "system",
+            "created_at": now_iso()
+        }
+        sample3 = {
+            "name": "Nmap",
+            "pattern": "nmap {target}",
+            "metadata_json": json.dumps({"params": [
+                {"name": "target", "type": "string", "label": "Target IP or Hostname", "default": "127.0.0.1"}]}),
+            "description": "Simple Nmap target scan",
+            "approved": 1,
+            "created_by": "system",
+            "created_at": now_iso()
+        }
+        sample4 = {
+            "name": "Nmap Ping Sweep",
+            "pattern": "nmap -sn {target}",
+            "metadata_json": json.dumps({"params": [
+                {"name": "targets", "type": "string", "label": "Targets (CIDR, range or comma-separated)",
+                 "default": ""}]}),
+            "description": "Ping sweep / host discovery for network (use CIDR or range).",
+            "approved": 1,
+            "created_by": "system",
+            "created_at": now_iso()
+        }
+        for s in (sample1, sample2, sample3, sample4):
+            DB.insert_sample_template(s)
 
 
 ensure_samples()
